@@ -305,6 +305,7 @@ message GetPaymentDetailRequest {
 // GET /bank/exchange-rates              → kursna lista (JSON: { rates: [...] })
 // GET /bank/exchange-rates?from=X&to=Y&amount=Z → konverzija (JSON: { result, bruto, ... })
 
+
 // ─── Service ──────────────────────────────────────────────────────────────────
 
 service BankaService {
