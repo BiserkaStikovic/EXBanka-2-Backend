@@ -2,11 +2,14 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strconv"
+	"time"
 
 	pb "banka-backend/proto/banka"
 	auth "banka-backend/shared/auth"
+	"banka-backend/services/bank-service/internal/domain"
 	"banka-backend/services/bank-service/internal/trading"
 
 	"github.com/shopspring/decimal"
@@ -62,8 +65,11 @@ func tradingError(err error) error {
 	case errors.Is(err, trading.ErrLimitPriceRequired),
 		errors.Is(err, trading.ErrStopPriceRequired),
 		errors.Is(err, trading.ErrInvalidOrderType),
-		errors.Is(err, trading.ErrInvalidDirection):
+		errors.Is(err, trading.ErrInvalidDirection),
+		errors.Is(err, trading.ErrListingTypeNotAllowed):
 		return status.Error(codes.InvalidArgument, err.Error())
+	case errors.Is(err, trading.ErrSettlementDatePassed):
+		return status.Error(codes.FailedPrecondition, err.Error())
 	default:
 		return status.Errorf(codes.Internal, "interna greška: %v", err)
 	}
@@ -150,9 +156,36 @@ func (h *BankHandler) TradingCreateOrder(ctx context.Context, req *pb.TradingCre
 		return nil, status.Errorf(codes.Internal, "neispravan korisnički ID u tokenu: %v", err)
 	}
 
+	// Resolve accountId: employees trade from the bank's USD trezor account.
+	// The frontend sends accountId=0 for employees; we resolve the real ID here.
+	accountID := req.GetAccountId()
+	if accountID == 0 && (claims.UserType == "EMPLOYEE" || claims.UserType == "ADMIN") {
+		trezorID, lookupErr := h.accountService.FindAccountIDByNumber(ctx, "666000122200000008")
+		if lookupErr != nil {
+			return nil, status.Errorf(codes.Internal, "greška pri traženju trezor računa: %v", lookupErr)
+		}
+		if trezorID == 0 {
+			return nil, status.Error(codes.Internal, "bankin USD trezor račun nije pronađen (broj: 666000122200000008)")
+		}
+		accountID = trezorID
+	}
+
+	// Determine supervisor status from JWT — the authoritative source.
+	// An ADMIN is always treated as a supervisor; for EMPLOYEE we check the
+	// permissions array for the "SUPERVISOR" permission.
+	isSupervisor := claims.UserType == "ADMIN"
+	if !isSupervisor {
+		for _, p := range claims.Permissions {
+			if p == "SUPERVISOR" {
+				isSupervisor = true
+				break
+			}
+		}
+	}
+
 	domainReq := &trading.CreateOrderRequest{
 		UserID:       userID,
-		AccountID:    req.GetAccountId(),
+		AccountID:    accountID,
 		ListingID:    req.GetListingId(),
 		OrderType:    trading.OrderType(req.GetOrderType()),
 		Direction:    trading.OrderDirection(req.GetDirection()),
@@ -161,6 +194,7 @@ func (h *BankHandler) TradingCreateOrder(ctx context.Context, req *pb.TradingCre
 		AfterHours:   req.GetAfterHours(),
 		AllOrNone:    req.GetAllOrNone(),
 		Margin:       req.GetMargin(),
+		IsSupervisor: isSupervisor,
 	}
 
 	ppu, err := parseOptionalDecimal(req.PricePerUnit, "price_per_unit")
@@ -175,6 +209,37 @@ func (h *BankHandler) TradingCreateOrder(ctx context.Context, req *pb.TradingCre
 	}
 	domainReq.StopPrice = sp
 
+	// ── Listing-level validations ─────────────────────────────────────────────
+	// Fetch listing once for all checks so we avoid multiple round-trips.
+	listing, err := h.listingService.GetListingByID(ctx, domainReq.ListingID)
+	if err != nil {
+		if errors.Is(err, domain.ErrListingNotFound) {
+			return nil, status.Errorf(codes.NotFound, "hartija od vrednosti nije pronađena: %d", domainReq.ListingID)
+		}
+		return nil, status.Errorf(codes.Internal, "greška pri dohvatu hartije: %v", err)
+	}
+
+	// Klijenti mogu trgovati samo akcijama i futures-ima (spec §2).
+	if claims.UserType == "CLIENT" {
+		if listing.ListingType != domain.ListingTypeStock && listing.ListingType != domain.ListingTypeFuture {
+			return nil, tradingError(trading.ErrListingTypeNotAllowed)
+		}
+	}
+
+	// Automatsko odbijanje za istekle FUTURE/OPTION instrumente (spec §7).
+	if listing.ListingType == domain.ListingTypeFuture || listing.ListingType == domain.ListingTypeOption {
+		if expired := settlementDateExpired(listing.DetailsJSON); expired {
+			return nil, tradingError(trading.ErrSettlementDatePassed)
+		}
+	}
+
+	// AfterHours detekcija: ako je berza zatvorena ili u after-hours periodu (spec §7).
+	// Frontend šalje false po defaultu; server uvek overriduje sa tačnom vrijednošću.
+	if marketStatus, msErr := h.berzaService.IsExchangeOpen(ctx, listing.ExchangeID); msErr == nil {
+		domainReq.AfterHours = marketStatus == domain.MarketStatusAfterHours ||
+			marketStatus == domain.MarketStatusClosed
+	}
+
 	order, err := h.tradingService.CreateOrder(ctx, domainReq)
 	if err != nil {
 		return nil, tradingError(err)
@@ -182,16 +247,39 @@ func (h *BankHandler) TradingCreateOrder(ctx context.Context, req *pb.TradingCre
 	return &pb.TradingCreateOrderResponse{Order: orderToPb(*order)}, nil
 }
 
+// settlementDateExpired returns true when the settlement_date in details_json
+// is in the past.  Returns false if the field is missing or cannot be parsed
+// (conservative: don't block orders on parse failures).
+func settlementDateExpired(detailsJSON string) bool {
+	var details struct {
+		SettlementDate string `json:"settlement_date"`
+	}
+	if err := json.Unmarshal([]byte(detailsJSON), &details); err != nil || details.SettlementDate == "" {
+		return false
+	}
+	// Accept both date-only and full RFC3339 formats.
+	for _, layout := range []string{"2006-01-02", time.RFC3339} {
+		if t, err := time.Parse(layout, details.SettlementDate); err == nil {
+			return t.Before(time.Now().UTC())
+		}
+	}
+	return false
+}
+
 // =============================================================================
 // TradingListOrders
 // =============================================================================
 
-// TradingListOrders returns all orders with an optional status filter.
-// Auth: EMPLOYEE only (supervisor dashboard).
+// TradingListOrders returns orders with an optional status filter.
+// Auth:
+//   - EMPLOYEE / ADMIN → returns ALL orders (supervisor dashboard view).
+//   - CLIENT           → returns only the caller's own orders (Moji nalozi view).
+//
 // Mapped to: GET /bank/trading/orders
 func (h *BankHandler) TradingListOrders(ctx context.Context, req *pb.TradingListOrdersRequest) (*pb.TradingListOrdersResponse, error) {
-	if _, err := extractEmployeeID(ctx); err != nil {
-		return nil, err
+	claims, ok := auth.ClaimsFromContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Unauthenticated, "niste autentifikovani")
 	}
 
 	var statusFilter *trading.OrderStatus
@@ -200,7 +288,21 @@ func (h *BankHandler) TradingListOrders(ctx context.Context, req *pb.TradingList
 		statusFilter = &v
 	}
 
-	orders, err := h.tradingService.ListOrders(ctx, statusFilter)
+	var orders []trading.Order
+	var err error
+
+	if claims.UserType == "CLIENT" {
+		callerID, parseErr := strconv.ParseInt(claims.Subject, 10, 64)
+		if parseErr != nil {
+			return nil, status.Errorf(codes.Internal, "neispravan korisnički ID u tokenu: %v", parseErr)
+		}
+		orders, err = h.tradingService.ListOrdersByUser(ctx, callerID, statusFilter)
+	} else if claims.UserType == "EMPLOYEE" || claims.UserType == "ADMIN" {
+		orders, err = h.tradingService.ListOrders(ctx, statusFilter)
+	} else {
+		return nil, status.Error(codes.PermissionDenied, "pristup odbijen")
+	}
+
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "greška pri dohvatu naloga: %v", err)
 	}
