@@ -82,6 +82,13 @@ func (m *mockInterbankRepo) GetNegotiationByID(ctx context.Context, rn int64, fi
 func (m *mockInterbankRepo) UpdateNegotiation(ctx context.Context, n *domain.InterbankNegotiation) error {
 	return m.Called(ctx, n).Error(0)
 }
+func (m *mockInterbankRepo) ListNegotiations(ctx context.Context, filter domain.ListInterbankNegotiationsFilter) ([]domain.InterbankNegotiation, error) {
+	args := m.Called(ctx, filter)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]domain.InterbankNegotiation), args.Error(1)
+}
 func (m *mockInterbankRepo) ListPublicStocks(ctx context.Context) ([]domain.PublicStock, error) {
 	args := m.Called(ctx)
 	if args.Get(0) == nil {
@@ -385,4 +392,43 @@ func TestInterbankOTC_CancelNegotiation_RepoError(t *testing.T) {
 
 	err := svc.CancelNegotiation(ctx, ourRouting, "x")
 	require.Error(t, err)
+}
+
+// ─── ListNegotiations ─────────────────────────────────────────────────────────
+
+func TestInterbankOTC_ListNegotiations_ClientFiltersBySeller(t *testing.T) {
+	repo := &mockInterbankRepo{}
+	ctx := context.Background()
+	svc := service.NewInterbankOTCService(repo, ourRouting)
+
+	sellerID := "4"
+	want := []domain.InterbankNegotiation{{
+		ID: 1, NegotiationRoutingNumber: ourRouting, NegotiationForeignID: "neg1",
+		StockTicker: "AAPL", Amount: 10, SellerRoutingNumber: ourRouting, SellerID: "4",
+		BuyerRoutingNumber: 222, BuyerID: "C-1", Status: "OPEN", IsOngoing: true,
+	}}
+	repo.On("ListNegotiations", ctx, domain.ListInterbankNegotiationsFilter{
+		NegotiationRoutingNumber: ourRouting, SellerID: &sellerID,
+	}).Return(want, nil)
+
+	got, err := svc.ListNegotiations(ctx, &sellerID)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, "AAPL", got[0].StockTicker)
+	repo.AssertExpectations(t)
+}
+
+func TestInterbankOTC_ListNegotiations_EmployeeNoSellerFilter(t *testing.T) {
+	repo := &mockInterbankRepo{}
+	ctx := context.Background()
+	svc := service.NewInterbankOTCService(repo, ourRouting)
+
+	repo.On("ListNegotiations", ctx, domain.ListInterbankNegotiationsFilter{
+		NegotiationRoutingNumber: ourRouting, SellerID: nil,
+	}).Return([]domain.InterbankNegotiation{}, nil)
+
+	got, err := svc.ListNegotiations(ctx, nil)
+	require.NoError(t, err)
+	require.Len(t, got, 0)
+	repo.AssertExpectations(t)
 }
