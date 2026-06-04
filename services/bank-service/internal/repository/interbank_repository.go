@@ -531,6 +531,23 @@ func (r *interbankRepository) UpdateNegotiation(ctx context.Context, n *domain.I
 	return r.db.WithContext(ctx).Save(mod).Error
 }
 
+func (r *interbankRepository) ListNegotiations(ctx context.Context, filter domain.ListInterbankNegotiationsFilter) ([]domain.InterbankNegotiation, error) {
+	q := r.db.WithContext(ctx).
+		Where("negotiation_routing_number = ?", filter.NegotiationRoutingNumber)
+	if filter.SellerID != nil {
+		q = q.Where("seller_routing_number = ? AND seller_id = ?", filter.NegotiationRoutingNumber, *filter.SellerID)
+	}
+	var models []interbankNegotiationModel
+	if err := q.Order("updated_at DESC").Find(&models).Error; err != nil {
+		return nil, err
+	}
+	out := make([]domain.InterbankNegotiation, 0, len(models))
+	for i := range models {
+		out = append(out, *negToDomain(&models[i]))
+	}
+	return out, nil
+}
+
 // ListPublicStocks agregira public_shares iz lokalnog portfolija po (listing, user)
 // — public_shares.quantity je već "javni režim" za OTC. Vraća listu po tickerima.
 func (r *interbankRepository) ListPublicStocks(ctx context.Context) ([]domain.PublicStock, error) {

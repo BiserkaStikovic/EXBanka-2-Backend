@@ -393,6 +393,12 @@ type InterbankNegotiation struct {
 	UpdatedAt                 time.Time
 }
 
+// ListInterbankNegotiationsFilter — filter za listu OTC pregovora koje mi hostujemo.
+type ListInterbankNegotiationsFilter struct {
+	NegotiationRoutingNumber int64   // pregovori koje hostujemo (naš routing)
+	SellerID                 *string // opciono: samo gde je prodavac ovaj korisnik (CLIENT)
+}
+
 // InterbankOptionContract — opcioni ugovor po prihvaćenoj OTC ponudi.
 type InterbankOptionContract struct {
 	ID                       int64
@@ -438,6 +444,7 @@ type InterbankRepository interface {
 	CreateNegotiation(ctx context.Context, n *InterbankNegotiation) error
 	GetNegotiationByID(ctx context.Context, routingNumber int64, foreignID string) (*InterbankNegotiation, error)
 	UpdateNegotiation(ctx context.Context, n *InterbankNegotiation) error
+	ListNegotiations(ctx context.Context, filter ListInterbankNegotiationsFilter) ([]InterbankNegotiation, error)
 	ListPublicStocks(ctx context.Context) ([]PublicStock, error)
 
 	// Option contracts (interbank)

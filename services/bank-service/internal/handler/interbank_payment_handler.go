@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"banka-backend/services/bank-service/internal/domain"
 	"banka-backend/services/bank-service/internal/service"
@@ -80,7 +81,7 @@ func (h *InterbankPaymentHandler) authenticate(r *http.Request) (int64, string, 
 
 func (h *InterbankPaymentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	userID, _, err := h.authenticate(r)
+	userID, userType, err := h.authenticate(r)
 	if err != nil {
 		writeIBError(w, http.StatusUnauthorized, "unauthorized")
 		return
@@ -92,6 +93,8 @@ func (h *InterbankPaymentHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		h.handleCreatePayment(w, r, userID)
 	case path == "/bank/interbank/public-stocks" && r.Method == http.MethodGet:
 		h.handlePublicStocks(w, r)
+	case path == "/bank/interbank/negotiations" && r.Method == http.MethodGet:
+		h.handleListNegotiations(w, r, userID, userType)
 	case path == "/bank/interbank/negotiations" && r.Method == http.MethodPost:
 		h.handleCreateNegotiation(w, r, userID)
 	case path == "/bank/interbank/contracts" && r.Method == http.MethodGet:
@@ -262,6 +265,57 @@ func (h *InterbankPaymentHandler) handleCreateNegotiation(w http.ResponseWriter,
 		return
 	}
 	writeIBJSON(w, http.StatusOK, id)
+}
+
+// ─── GET /bank/interbank/negotiations (dolazne ponude koje mi hostujemo) ──────
+
+type negotiationListItemDTO struct {
+	NegotiationID  domain.ForeignBankId `json:"negotiationId"`
+	Ticker         string               `json:"ticker"`
+	Amount         int32                `json:"amount"`
+	PricePerUnit   domain.MonetaryValue `json:"pricePerUnit"`
+	Premium        domain.MonetaryValue `json:"premium"`
+	SettlementDate string               `json:"settlementDate"`
+	Buyer          domain.ForeignBankId `json:"buyer"`
+	Seller         domain.ForeignBankId `json:"seller"`
+	Status         string               `json:"status"`
+	IsOngoing      bool                 `json:"isOngoing"`
+	LastModifiedBy domain.ForeignBankId `json:"lastModifiedBy"`
+	MyTurn         bool                 `json:"myTurn"`
+}
+
+// handleListNegotiations vraća OTC pregovore koje smo mi banka prodavca (host).
+// CLIENT vidi samo pregovore gde je on prodavac; AGENT/SUPERVISOR vide sve.
+func (h *InterbankPaymentHandler) handleListNegotiations(w http.ResponseWriter, r *http.Request, userID int64, userType string) {
+	var sellerID *string
+	if userType == "CLIENT" {
+		s := strconv.FormatInt(userID, 10)
+		sellerID = &s
+	}
+	rows, err := h.otcSvc.ListNegotiations(r.Context(), sellerID)
+	if err != nil {
+		writeIBError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	out := make([]negotiationListItemDTO, 0, len(rows))
+	for i := range rows {
+		n := &rows[i]
+		out = append(out, negotiationListItemDTO{
+			NegotiationID:  domain.ForeignBankId{RoutingNumber: n.NegotiationRoutingNumber, ID: n.NegotiationForeignID},
+			Ticker:         n.StockTicker,
+			Amount:         n.Amount,
+			PricePerUnit:   domain.MonetaryValue{Currency: n.PriceCurrency, Amount: n.PriceAmount},
+			Premium:        domain.MonetaryValue{Currency: n.PremiumCurrency, Amount: n.PremiumAmount},
+			SettlementDate: n.SettlementDate.Format(time.RFC3339),
+			Buyer:          domain.ForeignBankId{RoutingNumber: n.BuyerRoutingNumber, ID: n.BuyerID},
+			Seller:         domain.ForeignBankId{RoutingNumber: n.SellerRoutingNumber, ID: n.SellerID},
+			Status:         n.Status,
+			IsOngoing:      n.IsOngoing,
+			LastModifiedBy: domain.ForeignBankId{RoutingNumber: n.LastModifiedRoutingNumber, ID: n.LastModifiedID},
+			MyTurn:         n.IsOngoing && n.LastModifiedRoutingNumber != h.ourRoutingNumber,
+		})
+	}
+	writeIBJSON(w, http.StatusOK, out)
 }
 
 func (h *InterbankPaymentHandler) handleNegotiationsSubpath(w http.ResponseWriter, r *http.Request, userID int64) {

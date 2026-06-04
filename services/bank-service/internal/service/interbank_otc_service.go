@@ -141,6 +141,15 @@ func (s *InterbankOTCService) GetNegotiation(ctx context.Context, routing int64,
 	}, nil
 }
 
+// ListNegotiations — vraća OTC pregovore koje mi hostujemo (naš routing).
+// Ako je sellerID != nil, filtrira na pregovore gde je prodavac taj korisnik (za CLIENT).
+func (s *InterbankOTCService) ListNegotiations(ctx context.Context, sellerID *string) ([]domain.InterbankNegotiation, error) {
+	return s.repo.ListNegotiations(ctx, domain.ListInterbankNegotiationsFilter{
+		NegotiationRoutingNumber: s.ourRoutingNumber,
+		SellerID:                 sellerID,
+	})
+}
+
 // CancelNegotiation — DELETE /negotiations/{routing}/{id}; postavlja IsOngoing=false.
 func (s *InterbankOTCService) CancelNegotiation(ctx context.Context, routing int64, id string) error {
 	n, err := s.repo.GetNegotiationByID(ctx, routing, id)
